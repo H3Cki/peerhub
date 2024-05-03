@@ -35,11 +35,7 @@ func (h *Hub) GetAnsweringPeersPrevies() ([]AnsweringPeerPreview, error) {
 }
 
 func (h *Hub) CreateAnsweringPeer(req CreateAnsweringPeerRequest) (AnsweringPeer, error) {
-	ap := AnsweringPeer{
-		Name:          req.Name,
-		AccessKeys:    req.AccessKeys,
-		ManagementKey: req.ManagementKey,
-	}
+	ap := AnsweringPeer(req)
 
 	oldAP, err := h.peerSvc.GetAnsweringPeer(ap.Name)
 	if err == nil && oldAP.ManagementKeyMatches(ap.ManagementKey) {

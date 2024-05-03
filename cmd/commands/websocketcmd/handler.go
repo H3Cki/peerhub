@@ -53,21 +53,23 @@ func (h *handler) handleMessage(conn *websocket.Conn, msg message) error {
 	case messageTypeCreateAnsweringPeer:
 		req := peerhub.CreateAnsweringPeerRequest{}
 		if err := msg.UnmarshalData(&req); err != nil {
+			err = errors.Join(err, w.Error(err))
 			return err
 		}
 		err := h.handleCreateAnsweringPeer(w, req)
 		if err != nil {
-			w.Error(err)
+			err = errors.Join(err, w.Error(err))
 		}
 		return err
 	case messageTypeCreateOfferingPeer:
 		req := peerhub.CreateOfferingPeerRequest{}
 		if err := msg.UnmarshalData(&req); err != nil {
+			err = errors.Join(err, w.Error(err))
 			return err
 		}
 		err := h.handleCreateOfferingPeer(w, req)
 		if err != nil {
-			w.Error(err)
+			err = errors.Join(err, w.Error(err))
 		}
 		return err
 	case messageTypeOfferAnswer:
@@ -77,7 +79,7 @@ func (h *handler) handleMessage(conn *websocket.Conn, msg message) error {
 		}
 		err := h.handleCreateAnswer(w, req)
 		if err != nil {
-			w.Error(err)
+			err = errors.Join(err, w.Error(err))
 		}
 		return err
 	}

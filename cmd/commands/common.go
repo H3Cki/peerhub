@@ -22,7 +22,14 @@ func AnsweringsHandler(h *peerhub.Hub) func(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
-		b, _ := json.Marshal(aps)
-		w.Write(b)
+		b, err := json.Marshal(aps)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		if _, err := w.Write(b); err != nil {
+			fmt.Println(err)
+		}
 	}
 }

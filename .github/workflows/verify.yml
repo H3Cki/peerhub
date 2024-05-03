@@ -1,4 +1,4 @@
-name: run
+name: verify
 on: push
 jobs:
   build:

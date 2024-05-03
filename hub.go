@@ -1,179 +1,199 @@
-package sdphub
+package peerhub
 
-import (
-	"errors"
-	"fmt"
+import "errors"
 
-	"github.com/go-playground/validator/v10"
-)
-
-var (
-	validate = validator.New()
-
-	ErrOffererAlreadyExists = errors.New("offerer already exists")
-	ErrOfferNotFound        = errors.New("offer not found")
-	ErrAnswererNotFound     = errors.New("answerer not found")
-	ErrAgreementNotFound    = errors.New("match not found")
-	ErrInvalidAccessKey     = errors.New("invalid access key")
-	ErrUnknownMessageType   = errors.New("unknown message type")
-)
+type HubConfig struct {
+	PeerService   PeerService
+	SignalService SignalService
+}
 
 type Hub struct {
-	reg *Registry
+	peerSvc PeerService
+	dealSvc SignalService
 }
 
-func NewHub() *Hub {
+func NewHub(cfg HubConfig) *Hub {
 	return &Hub{
-		reg: NewRegistry(),
+		peerSvc: cfg.PeerService,
+		dealSvc: cfg.SignalService,
 	}
 }
 
-// Answerers lists all answerers
-func (h *Hub) Answerers() []Answerer {
-	return h.reg.Answerers()
-}
-
-// CreateAnswerer creates an answerer
-func (h *Hub) CreateAnswerer(ctx MessageContext, req CreateAnswererRequest) error {
-	a := Answerer{
-		Name:          req.Name,
-		Description:   req.Description,
-		AccessKey:     req.AccessKey,
-		ManagementKey: req.ManagementKey,
-		Conn:          ctx.Conn,
-		Address:       ctx.Addr,
-		LastMessage:   ctx.MessageTime,
-		ConvID:        ctx.ConvID,
-	}
-
-	replaced, err := h.reg.CreateAnswerer(a)
+func (h *Hub) GetAnsweringPeersPrevies() ([]AnsweringPeerPreview, error) {
+	aps, err := h.peerSvc.GetAnsweringPeers()
 	if err != nil {
-		return err
+		return nil, err
+	}
+	apps := []AnsweringPeerPreview{}
+	for _, ap := range aps {
+		apps = append(apps, AnsweringPeerPreview{
+			Name:      ap.Name,
+			Protected: len(ap.AccessKeys) != 0,
+		})
+	}
+	return apps, nil
+}
+
+func (h *Hub) CreateAnsweringPeer(req CreateAnsweringPeerRequest) (AnsweringPeer, error) {
+	ap := AnsweringPeer{
+		Name:          req.Name,
+		AccessKeys:    req.AccessKeys,
+		ManagementKey: req.ManagementKey,
 	}
 
-	if replaced != nil && replaced.Conn != a.Conn {
-		if err := replaced.Conn.Close(); err != nil {
-			fmt.Println("error closing replaced registrants connection")
-		}
-	}
-
-	SendInfo(ctx, "registration complete")
-
-	go func() {
-		err := h.handleOfferers(a)
+	oldAP, err := h.peerSvc.GetAnsweringPeer(ap.Name)
+	if err == nil && oldAP.ManagementKeyMatches(ap.ManagementKey) {
+		err := h.peerSvc.UpdateAnsweringPeer(ap)
 		if err != nil {
-			fmt.Println(err)
+			return AnsweringPeer{}, err
 		}
-	}()
+		return ap, nil
+	}
 
-	return nil
+	if !errors.Is(err, ErrAnsweringPeerNotFound) {
+		return AnsweringPeer{}, err
+	}
+
+	err = h.peerSvc.CreateAnsweringPeer(ap)
+	if err != nil {
+		return AnsweringPeer{}, err
+	}
+
+	return ap, nil
 }
 
-// SendOffer attempts to make an agreement with an answerer, it fails if the answerer
-// does not exist or access key doesn't match.
-func (h *Hub) SendOffer(ctx MessageContext, req CreateOffererRequest) error {
-	a, ok := h.reg.Answerer(req.AnswererName)
-	if !ok {
-		return ErrAnswererNotFound
+func (h *Hub) CreateOfferingPeer(req CreateOfferingPeerRequest) (OfferingPeer, error) {
+	op := OfferingPeer{
+		Name:            req.Name,
+		TargetName:      req.TargetName,
+		TargetAccessKey: req.TargetAccessKey,
+		ManagementKey:   req.ManagementKey,
+		SDP:             req.SDP,
+		Delete:          req.Delete,
 	}
 
-	o := Offerer{
-		Name:          req.Name,
-		AnswererName:  req.AnswererName,
-		AccessKey:     req.AccessKey,
-		ManagementKey: req.ManagementKey,
-		SDP:           req.SDP,
-		Conn:          ctx.Conn,
-		Address:       ctx.Addr,
-		LastMessage:   ctx.MessageTime,
-		ConvID:        ctx.ConvID,
+	oldOP, err := h.peerSvc.GetOfferingPeer(op.Name)
+	if err == nil && oldOP.ManagementKeyMatches(op.ManagementKey) {
+		err := h.peerSvc.UpdateOfferingPeer(op)
+		if err != nil {
+			return OfferingPeer{}, err
+		}
+		return op, nil
 	}
 
-	return h.createAgreement(o, a)
+	if !errors.Is(err, ErrOfferingPeerNotFound) {
+		return OfferingPeer{}, err
+	}
+
+	if err := h.peerSvc.CreateOfferingPeer(op); err != nil {
+		return OfferingPeer{}, err
+	}
+
+	return op, nil
 }
 
-// CreateOfferer attempts to make an agreement with an answerer, it fails if access key
-// doesn't match and adds an offerer which will be answered as soon as matching answerer appears.
-// In case of an access key mismatch with matching answerer error message will be sent.
-func (h *Hub) CreateOfferer(ctx MessageContext, req CreateOffererRequest) error {
-	o := Offerer{
-		Name:          req.Name,
-		AnswererName:  req.AnswererName,
-		AccessKey:     req.AccessKey,
-		ManagementKey: req.ManagementKey,
-		SDP:           req.SDP,
-		ConvID:        ctx.ConvID,
-		Conn:          ctx.Conn,
-		Address:       ctx.Addr,
-		LastMessage:   ctx.MessageTime,
+// CreateAnswer creates an answer and returns the Offer which the answer relates to
+func (h *Hub) CreateAnswer(req CreateAnswerRequest) (Answer, Offer, error) {
+	offer, err := h.dealSvc.GetOffer(req.OfferID)
+	if err != nil {
+		return Answer{}, Offer{}, err
+	}
+	answer := NewAnswer(offer.ID, offer.AnsweringPeer, req.SDP)
+	return answer, offer, nil
+}
+
+func (h *Hub) OffersForAnsweringPeer(ap AnsweringPeer) ([]Offer, []FailedOffer, error) {
+	ops, err := h.peerSvc.GetOfferingPeersByTarget(ap.Name)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	a, ok := h.reg.Answerer(req.AnswererName)
-	if !ok {
-		existingOfferer, ok := h.reg.Offerer(o.AnswererName, o.Name)
-		if ok {
-			if !existingOfferer.ManagementKeyMatches(o.ManagementKey) {
-				return ErrOffererAlreadyExists
+	offers := []Offer{}
+	fOffers := []FailedOffer{}
+
+	for _, op := range ops {
+		if !ap.AccessKeyMatches(op.TargetAccessKey) {
+			fo := FailedOffer{
+				OfferingPeer:  op.Name,
+				AnsweringPeer: ap.Name,
+				Error:         err,
 			}
-			return h.reg.CreateOfferer(o)
+			fOffers = append(fOffers, fo)
+			continue
 		}
 
-		h.reg.CreateOfferer(o)
-		return nil
+		offer := NewOffer(op.Name, op.SDP, ap.Name)
+		offers = append(offers, offer)
 	}
 
-	return h.createAgreement(o, a)
+	return offers, fOffers, nil
 }
 
-func (h *Hub) AcceptAgreement(ctx MessageContext, req AcceptAgreementRequest) error {
-	agr, ok := h.reg.Agreement(req.AgreementID)
-	if !ok {
-		return ErrAgreementNotFound
+func (h *Hub) OfferFromOfferingPeer(op OfferingPeer) (offer Offer, failedOffer FailedOffer, isOffer, isFailed bool, err error) {
+	ap, err := h.peerSvc.GetAnsweringPeer(op.TargetName)
+	if op.IgnoreNotFound && errors.Is(err, ErrAnsweringPeerNotFound) {
+		return Offer{}, FailedOffer{}, false, false, nil
+	}
+	if err != nil {
+		return Offer{}, FailedOffer{}, false, false, err
 	}
 
-	//todo notify answerer about failures
+	if !ap.AccessKeyMatches(op.TargetAccessKey) {
+		fo := FailedOffer{
+			OfferingPeer:  op.Name,
+			AnsweringPeer: ap.Name,
+			Error:         ErrInvalidAccessKey,
+		}
+		return Offer{}, fo, false, true, err
+	}
 
-	defer func() {
-		h.reg.DeleteAgreement(agr.ID)
-	}()
+	o := NewOffer(op.Name, op.SDP, ap.Name)
+	if err := h.dealSvc.CreateOffer(o); err != nil {
+		return Offer{}, FailedOffer{}, false, false, err
+	}
 
-	return agr.AnswerToOfferer(req.SDP)
+	return o, FailedOffer{}, true, false, nil
 }
 
-func (h *Hub) RejectAgreement(tx MessageContext, req RejectAgreementRequest) error {
-	agr, ok := h.reg.Agreement(req.AgreementID)
-	if !ok {
-		return ErrAgreementNotFound
-	}
-
-	//todo notify answerer about failures
-
-	defer func() {
-		h.reg.DeleteAgreement(agr.ID)
-	}()
-
-	return SendError(MessageContext{
-		Conn:   agr.Offerer.Conn,
-		ConvID: agr.Offerer.ConvID,
-	}, fmt.Errorf("agreement %s rejected: %s", agr.ID, req.Reason))
+func (h *Hub) DeleteAnsweringPeer(_ DeleteAnsweringPeerRequest) error {
+	panic("not implemented") // TODO: Implement
 }
 
-func (h *Hub) handleOfferers(a Answerer) error {
-	offerers := h.reg.Offerers(a.Name)
-	errs := []error{}
-	for _, o := range offerers {
-		err := h.createAgreement(o, a)
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+func (h *Hub) DeleteOfferingPeer(_ DeleteOfferingPeerRequest) error {
+	panic("not implemented") // TODO: Implement
 }
 
-func (h *Hub) createAgreement(o Offerer, a Answerer) error {
-	if !a.AccessKeyMatches(o.AccessKey) {
-		return ErrInvalidAccessKey
-	}
+type CreateAnsweringPeerRequest struct {
+	Name          string   `json:"name"`
+	AccessKeys    []string `json:"accesskey"`
+	ManagementKey string   `json:"managementkey"`
+}
 
-	agr := NewAgreement(o, a)
-	h.reg.CreateAgreement(agr)
-	return agr.OfferToAnswerer()
+type CreateAnswerRequest struct {
+	OfferID string `json:"offerID"`
+	SDP     string `json:"sdp"`
+}
+
+type DealForAnsweringPeerRequest struct {
+	OfferingPeerName  string `json:"offeringpeername"`
+	AnsweringPeerName string `json:"answeringpeername"`
+	AccessKey         string `json:"accesskey"`
+	SDP               string `json:"sdp"`
+}
+
+type DeleteAnsweringPeerRequest struct {
+	PeerID string
+}
+
+type CreateOfferingPeerRequest struct {
+	Name            string `json:"name"`
+	TargetName      string `json:"targetname"`
+	TargetAccessKey string `json:"targetaccesskey"`
+	ManagementKey   string `json:"managementkey"`
+	SDP             string `json:"sdp"`
+	Delete          bool   `json:"delete"`
+}
+
+type DeleteOfferingPeerRequest struct {
+	PeerID string
 }
